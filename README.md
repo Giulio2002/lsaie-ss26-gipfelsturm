@@ -115,6 +115,43 @@ All training is launched via `launch.sh <mode> <model_size> [steps] [nodes]`. Th
 ./launch.sh throughput 8b 50 1        # 50 steps, 1 node
 ```
 
+For Challenge 2 kernel experiments, `launch.sh` also accepts environment
+overrides without changing the default baseline:
+
+```bash
+# Transformer Engine attention backend sweep point.
+SEQ_LEN=8192 ATTENTION_BACKEND=flash ./launch.sh throughput 760m 30 1
+
+# cuDNN fused attention through Transformer Engine.
+ATTENTION_BACKEND=fused ./launch.sh throughput 760m 30 1
+
+# Local PyTorch/Megatron attention reference path.
+TRANSFORMER_IMPL=local ATTENTION_BACKEND=local ./launch.sh throughput 125m 20 1
+
+# Single-node tensor parallel experiment.
+TP=4 MBS=1 GBS=128 ATTENTION_BACKEND=flash ./launch.sh throughput 8b 50 1
+
+# Capture an NSYS trace around iterations 10-12.
+PROFILE_NSYS=true PROFILE_STEP_START=10 PROFILE_STEP_END=12 \
+    ATTENTION_BACKEND=flash ./launch.sh throughput 760m 20 1
+```
+
+Supported attention backends are `auto`, `flash`, `fused`, `unfused`, and
+`local`. `local` must be paired with `TRANSFORMER_IMPL=local`; the other
+backends use the default `transformer_engine` implementation. The launcher
+also supports `SEQ_LEN`, `MBS`, `GBS`, `TP`, `PP`, `CUDA_GRAPH_IMPL`, and
+`CUDA_GRAPH_SCOPE` overrides. Generated job names and log directories include
+the backend, sequence length, TP, and PP values so W&B/TensorBoard runs can be
+compared directly.
+
+Giulio's short attention sweep helper submits a backend x sequence-length grid:
+
+```bash
+bash benchmark_giulio_attention.sh
+MODEL_SIZE=760m STEPS=30 NODES=1 SEQ_LENS="512 1024 2048 4096 8192" \
+    BACKENDS="auto flash fused unfused local" bash benchmark_giulio_attention.sh
+```
+
 **Train** mode runs a specified number of steps with W&B and Tensorboard logging:
 
 ```bash

@@ -14,6 +14,12 @@
 #            ./launch.sh throughput 8b 50 1
 #            ./launch.sh train 760m 5000
 #            ./launch.sh train 1.5b 3000 8
+#
+# Optional throughput knobs, set as environment variables:
+#   SEQ_LEN=8192 ATTENTION_BACKEND=flash ./launch.sh throughput 760m 50 1
+#   TRANSFORMER_IMPL=local ATTENTION_BACKEND=local ./launch.sh throughput 125m 20 1
+#   TP=4 MBS=1 GBS=128 ./launch.sh throughput 8b 50 1
+#   PROFILE_NSYS=true PROFILE_STEP_START=10 PROFILE_STEP_END=12 ./launch.sh throughput 760m 20 1
 
 set -euo pipefail
 
@@ -21,6 +27,7 @@ source "$(dirname "$0")/config.sh"
 
 MODE=${1:?Usage: ./launch.sh <mode> <model_size> [steps] [nodes]}
 MODEL_SIZE=${2:?Usage: ./launch.sh <mode> <model_size> [steps] [nodes]}
+MBS_OVERRIDE=${MBS:-}
 
 ################ Mode config ################
 case $MODE in
@@ -85,9 +92,44 @@ case $MODEL_SIZE in
         ;;
 esac
 
-GBS=256
-SEQ_LEN=4096
-JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${TRAINING_STEPS}s-${NODES}n"
+MBS=${MBS_OVERRIDE:-$MBS}
+GBS=${GBS:-256}
+SEQ_LEN=${SEQ_LEN:-4096}
+TP=${TP:-1}
+PP=${PP:-1}
+TRANSFORMER_IMPL=${TRANSFORMER_IMPL:-transformer_engine}
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-auto}
+CUDA_GRAPH_IMPL=${CUDA_GRAPH_IMPL:-none}
+CUDA_GRAPH_SCOPE=${CUDA_GRAPH_SCOPE:-}
+PROFILE_NSYS=${PROFILE_NSYS:-false}
+PROFILE_STEP_START=${PROFILE_STEP_START:-10}
+PROFILE_STEP_END=${PROFILE_STEP_END:-12}
+PROFILE_RANKS=${PROFILE_RANKS:-0}
+DRY_RUN=${DRY_RUN:-false}
+
+case $ATTENTION_BACKEND in
+    auto|flash|fused|unfused|local) ;;
+    *)
+        echo "Unknown ATTENTION_BACKEND: $ATTENTION_BACKEND. Choose: auto, flash, fused, unfused, local"
+        exit 1
+        ;;
+esac
+
+case $TRANSFORMER_IMPL in
+    transformer_engine|local) ;;
+    *)
+        echo "Unknown TRANSFORMER_IMPL: $TRANSFORMER_IMPL. Choose: transformer_engine, local"
+        exit 1
+        ;;
+esac
+
+if [ "$ATTENTION_BACKEND" = "local" ] && [ "$TRANSFORMER_IMPL" != "local" ]; then
+    echo "ATTENTION_BACKEND=local requires TRANSFORMER_IMPL=local."
+    exit 1
+fi
+
+KERNEL_TAG=${KERNEL_TAG:-${TRANSFORMER_IMPL}-${ATTENTION_BACKEND}}
+JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${KERNEL_TAG}-${SEQ_LEN}seq-${TRAINING_STEPS}s-${NODES}n"
 
 ################ W&B block ################
 if [ "$WANDB" = true ]; then
@@ -151,10 +193,20 @@ MBS=${MBS}
 GBS=${GBS}
 SEQ_LEN=${SEQ_LEN}
 TRAINING_STEPS=${TRAINING_STEPS}
+TP=${TP}
+PP=${PP}
+TRANSFORMER_IMPL=${TRANSFORMER_IMPL}
+ATTENTION_BACKEND=${ATTENTION_BACKEND}
+CUDA_GRAPH_IMPL=${CUDA_GRAPH_IMPL}
+CUDA_GRAPH_SCOPE="${CUDA_GRAPH_SCOPE}"
+PROFILE_NSYS=${PROFILE_NSYS}
+PROFILE_STEP_START=${PROFILE_STEP_START}
+PROFILE_STEP_END=${PROFILE_STEP_END}
+PROFILE_RANKS="${PROFILE_RANKS}"
 
 # Logging
 PROJECT_NAME=gipfelsturm
-EXP_NAME=${MODE}-${MODEL_SIZE}-\${SLURM_NNODES}n
+EXP_NAME=${MODE}-${MODEL_SIZE}-${KERNEL_TAG}-${SEQ_LEN}seq-tp${TP}-pp${PP}-\${SLURM_NNODES}n
 LOG_DIR=/iopsstor/scratch/cscs/\$USER/gipfelsturm/\$PROJECT_NAME/\$EXP_NAME
 TENSORBOARD_DIR=\$LOG_DIR/tensorboard
 CONFIGS
@@ -177,11 +229,45 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 MASTER_ADDR=$(hostname)
 MASTER_PORT=25678
 
-TRANSFORMER_ENGINE_ARGS=(
-    --transformer-impl transformer_engine
-    --use-precision-aware-optimizer
-    --main-grads-dtype bf16
+TRANSFORMER_ARGS=(
+    --transformer-impl ${TRANSFORMER_IMPL}
 )
+
+if [ "${TRANSFORMER_IMPL}" = "transformer_engine" ]; then
+    TRANSFORMER_ARGS+=(
+        --use-precision-aware-optimizer
+        --main-grads-dtype bf16
+    )
+fi
+
+ATTENTION_ARGS=(
+    --attention-backend ${ATTENTION_BACKEND}
+)
+
+if [ "${ATTENTION_BACKEND}" = "local" ]; then
+    ATTENTION_ARGS+=(--spec local)
+fi
+
+CUDA_GRAPH_ARGS=()
+if [ "${CUDA_GRAPH_IMPL}" != "none" ]; then
+    CUDA_GRAPH_ARGS+=(--cuda-graph-impl ${CUDA_GRAPH_IMPL})
+    if [ -n "${CUDA_GRAPH_SCOPE}" ]; then
+        CUDA_GRAPH_ARGS+=(--cuda-graph-scope ${CUDA_GRAPH_SCOPE})
+    fi
+    if [ "${CUDA_GRAPH_IMPL}" = "transformer_engine" ]; then
+        CUDA_GRAPH_ARGS+=(--te-rng-tracker)
+    fi
+fi
+
+PROFILE_ARGS=()
+if [ "${PROFILE_NSYS}" = "true" ]; then
+    PROFILE_ARGS+=(
+        --profile
+        --profile-step-start ${PROFILE_STEP_START}
+        --profile-step-end ${PROFILE_STEP_END}
+        --profile-ranks ${PROFILE_RANKS}
+    )
+fi
 
 SETUP
 
@@ -248,8 +334,8 @@ MIXED_PRECISION_ARGS=(
 )
 
 DISTRIBUTED_ARGS=(
-    --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 1
+    --tensor-model-parallel-size ${TP}
+    --pipeline-model-parallel-size ${PP}
     --use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather
@@ -290,7 +376,10 @@ TORCHRUN_ARGS=(
 )
 
 TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
-    ${TRANSFORMER_ENGINE_ARGS[@]} \
+    ${TRANSFORMER_ARGS[@]} \
+    ${ATTENTION_ARGS[@]} \
+    ${CUDA_GRAPH_ARGS[@]} \
+    ${PROFILE_ARGS[@]} \
     ${NETWORK_SIZE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${REGULARIZATION_ARGS[@]} \
@@ -308,7 +397,8 @@ cat >> "$SCRIPT" << 'WANDB_PLACEHOLDER'
 WANDB_PLACEHOLDER
 
 # Replace placeholder with actual W&B block
-sed -i '/^WANDB_PLACEHOLDER$/d' "$SCRIPT"
+sed -i.bak '/^WANDB_PLACEHOLDER$/d' "$SCRIPT"
+rm -f "$SCRIPT.bak"
 cat >> "$SCRIPT" << WANDB_INSERT
 ${WANDB_BLOCK}
 WANDB_INSERT
@@ -316,6 +406,10 @@ WANDB_INSERT
 cat >> "$SCRIPT" << 'FOOTER'
 
 echo "CMD: $TRAINING_CMD"
+if [ "${PROFILE_NSYS}" = "true" ]; then
+    mkdir -p "$LOG_DIR/nsys"
+    TRAINING_CMD="nsys profile -s none -t nvtx,cuda -o $LOG_DIR/nsys/${EXP_NAME}-${SLURM_JOB_ID} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop $TRAINING_CMD"
+fi
 srun -lu --mpi=pmix --network=disable_rdzv_get --environment=alps3 --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "numactl --membind=0-3 $TRAINING_CMD"
 
 echo "END TIME: $(date)"
@@ -324,4 +418,8 @@ FOOTER
 chmod +x "$SCRIPT"
 
 echo "Generated: $SCRIPT"
-sbatch "$SCRIPT"
+if [ "$DRY_RUN" = "true" ]; then
+    echo "DRY_RUN=true, not submitting $SCRIPT"
+else
+    sbatch "$SCRIPT"
+fi
