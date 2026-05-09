@@ -18,6 +18,7 @@
 # Optional throughput knobs, set as environment variables:
 #   SEQ_LEN=8192 ATTENTION_BACKEND=flash ./launch.sh throughput 760m 50 1
 #   TRANSFORMER_IMPL=local ATTENTION_BACKEND=local ./launch.sh throughput 125m 20 1
+#   GPUS_PER_NODE=2 ./launch.sh throughput 125m 50 1
 #   TP=4 MBS=1 GBS=128 ./launch.sh throughput 8b 50 1
 #   PROFILE_NSYS=true PROFILE_STEP_START=10 PROFILE_STEP_END=12 ./launch.sh throughput 760m 20 1
 
@@ -97,6 +98,7 @@ GBS=${GBS:-256}
 SEQ_LEN=${SEQ_LEN:-4096}
 TP=${TP:-1}
 PP=${PP:-1}
+GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 TRANSFORMER_IMPL=${TRANSFORMER_IMPL:-transformer_engine}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-auto}
 CUDA_GRAPH_IMPL=${CUDA_GRAPH_IMPL:-none}
@@ -106,6 +108,14 @@ PROFILE_STEP_START=${PROFILE_STEP_START:-10}
 PROFILE_STEP_END=${PROFILE_STEP_END:-12}
 PROFILE_RANKS=${PROFILE_RANKS:-0}
 DRY_RUN=${DRY_RUN:-false}
+
+case $GPUS_PER_NODE in
+    1|2|3|4) ;;
+    *)
+        echo "Unknown GPUS_PER_NODE: $GPUS_PER_NODE. Choose: 1, 2, 3, or 4"
+        exit 1
+        ;;
+esac
 
 case $ATTENTION_BACKEND in
     auto|flash|fused|unfused|local) ;;
@@ -129,7 +139,8 @@ if [ "$ATTENTION_BACKEND" = "local" ] && [ "$TRANSFORMER_IMPL" != "local" ]; the
 fi
 
 KERNEL_TAG=${KERNEL_TAG:-${TRANSFORMER_IMPL}-${ATTENTION_BACKEND}}
-JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${KERNEL_TAG}-${SEQ_LEN}seq-${TRAINING_STEPS}s-${NODES}n"
+TOTAL_GPUS=$((NODES * GPUS_PER_NODE))
+JOB_NAME="gipfel-${MODE}-${MODEL_SIZE}-${KERNEL_TAG}-${SEQ_LEN}seq-${TRAINING_STEPS}s-${TOTAL_GPUS}g"
 
 ################ W&B block ################
 if [ "$WANDB" = true ]; then
@@ -166,7 +177,7 @@ cat >> "$SCRIPT" << SBATCH_DIRECTIVES
 #SBATCH --error=logs/%x-%j.log
 #SBATCH --nodes=${NODES}
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=${GPUS_PER_NODE}
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
 #SBATCH --no-requeue
@@ -195,6 +206,8 @@ SEQ_LEN=${SEQ_LEN}
 TRAINING_STEPS=${TRAINING_STEPS}
 TP=${TP}
 PP=${PP}
+GPUS_PER_NODE=${GPUS_PER_NODE}
+TOTAL_GPUS=${TOTAL_GPUS}
 TRANSFORMER_IMPL=${TRANSFORMER_IMPL}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 CUDA_GRAPH_IMPL=${CUDA_GRAPH_IMPL}
@@ -206,7 +219,7 @@ PROFILE_RANKS="${PROFILE_RANKS}"
 
 # Logging
 PROJECT_NAME=gipfelsturm
-EXP_NAME=${MODE}-${MODEL_SIZE}-${KERNEL_TAG}-${SEQ_LEN}seq-tp${TP}-pp${PP}-\${SLURM_NNODES}n
+EXP_NAME=${MODE}-${MODEL_SIZE}-${KERNEL_TAG}-${SEQ_LEN}seq-tp${TP}-pp${PP}-${TOTAL_GPUS}g
 LOG_DIR=/iopsstor/scratch/cscs/\$USER/gipfelsturm/\$PROJECT_NAME/\$EXP_NAME
 TENSORBOARD_DIR=\$LOG_DIR/tensorboard
 CONFIGS
